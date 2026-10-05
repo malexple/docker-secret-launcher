@@ -18,6 +18,8 @@ repositories {
 
 dependencies {
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.0'
+    implementation 'org.linguafranca.pwdb:KeePassJava2:2.2.4'
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
 }
 
 application {

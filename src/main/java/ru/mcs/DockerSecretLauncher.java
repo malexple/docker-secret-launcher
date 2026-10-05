@@ -1,82 +1,229 @@
 package ru.mcs;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.io.Console;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class DockerSecretLauncher {
 
+    // {VAR_NAME} — имя переменной в KeePass
+    private static final Pattern PLACEHOLDER = Pattern.compile("\\{([A-Za-z_][A-Za-z0-9_]*)\\}");
+
     public static void main(String[] args) {
         try {
-            // Парсим аргументы командной строки
-            String composeFile = null;
+            String kdbxPath = null;
+            String context = null;
+            String service = null;
+            String get = null;
+            boolean list = false;
+            boolean quiet = false;
+            boolean strict = false;
+            boolean showCmd = false;
+
+            // Находим индекс "--" — всё после него команда
+            int dashDash = -1;
             for (int i = 0; i < args.length; i++) {
-                if (("-f".equals(args[i]) || "--file".equals(args[i])) && i + 1 < args.length) {
-                    composeFile = args[i + 1];
-                    i++;
+                if ("--".equals(args[i])) { dashDash = i; break; }
+            }
+
+            // Парсим только то, что ДО "--"
+            int endArgs = (dashDash >= 0) ? dashDash : args.length;
+            for (int i = 0; i < endArgs; i++) {
+                switch (args[i]) {
+                    case "--kdbx":    if (i+1 < endArgs) kdbxPath = args[++i]; break;
+                    case "--context": case "-c": if (i+1 < endArgs) context = args[++i]; break;
+                    case "--service": case "-s": if (i+1 < endArgs) service = args[++i]; break;
+                    case "--get":     if (i+1 < endArgs) get = args[++i]; break;
+                    case "--list":    list = true; break;
+                    case "--quiet": case "-q": quiet = true; break;
+                    case "--strict":  strict = true; break;
+                    case "--show-cmd": showCmd = true; break;
+                    default:
+                        System.err.println("Неизвестный аргумент: " + args[i]);
+                        printUsage();
+                        System.exit(1);
                 }
             }
 
-            // 1. Читаем .env
-            Set<String> variableNames = EnvFileReader.readVariableNames(LauncherConfig.ENV_FILE);
-            if (variableNames.isEmpty()) {
-                System.err.println("В файле " + LauncherConfig.ENV_FILE + " не найдено переменных.");
+            // Команда после "--"
+            List<String> rawCommand = new ArrayList<>();
+            if (dashDash >= 0) {
+                for (int i = dashDash + 1; i < args.length; i++) {
+                    rawCommand.add(args[i]);
+                }
+            }
+
+            if (service == null) {
+                service = Paths.get("").toAbsolutePath().getFileName().toString();
+            }
+
+            // ===== Режимы --get / --list =====
+            if (get != null || list) {
+                if (kdbxPath == null) { System.err.println("Нужен --kdbx"); System.exit(1); }
+                char[] pwd = readPasswordSilently();
+                try {
+                    if (list) {
+                        KdbxSecretReader.listNames(kdbxPath, pwd, service, context, strict)
+                                .forEach(System.out::println);
+                        return;
+                    }
+                    String v = KdbxSecretReader.getOne(kdbxPath, pwd, service, context, get, strict);
+                    if (v == null) { System.err.println("Не найдено: " + get); System.exit(2); }
+                    System.out.println(quiet ? v : (get + "=" + v));
+                    return;
+                } finally {
+                    Arrays.fill(pwd, '\0');
+                }
+            }
+
+            // ===== Режим запуска команды =====
+
+            // Если команда не задана — по умолчанию docker compose
+            if (rawCommand.isEmpty()) {
+                rawCommand = List.of("docker", "compose", "up", "-d");
+            }
+
+            // 1. Собираем имена переменных:
+            //    - из плейсхолдеров {VAR} в команде
+            //    - из .env (если файл есть — для обратной совместимости)
+            Set<String> needed = new LinkedHashSet<>();
+            for (String arg : rawCommand) {
+                Matcher m = PLACEHOLDER.matcher(arg);
+                while (m.find()) {
+                    needed.add(m.group(1));
+                }
+            }
+            // .env опционален, если команда уже содержит плейсхолдеры
+            if (needed.isEmpty() && Paths.get(LauncherConfig.ENV_FILE).toFile().exists()) {
+                needed.addAll(EnvFileReader.readVariableNames(LauncherConfig.ENV_FILE));
+            }
+
+            if (needed.isEmpty()) {
+                System.err.println("Не найдено ни плейсхолдеров {VAR}, ни .env. Нечего делать.");
                 System.exit(1);
             }
-            System.out.println("Переменные из .env: " + variableNames);
+            System.out.println("Нужны секреты: " + needed);
 
-            // 2. KeePassHttp
-            KeePassHttpClient keepass = new KeePassHttpClient();
-
-            // 3. Секреты
+            // 2. Получаем секреты из KeePass
             Map<String, String> secrets = new HashMap<>();
-            for (String varName : variableNames) {
-                String secret = keepass.getSecret(varName);
-                if (secret != null) {
-                    secrets.put(varName, secret);
-                    System.out.println("  ✓ " + varName + " — секрет получен");
-                } else {
-                    System.err.println("  ✗ " + varName + " — секрет НЕ найден");
+            if (kdbxPath != null) {
+                char[] pwd = readPasswordSilently();
+                try {
+                    for (String name : needed) {
+                        String v = KdbxSecretReader.getOne(kdbxPath, pwd, service, context, name, strict);
+                        if (v != null) {
+                            secrets.put(name, v);
+                            System.out.println("  [+] " + name);
+                        } else if (strict) {
+                            System.err.println("  [-] " + name + " не найден (strict)");
+                            System.exit(1);
+                        } else {
+                            System.err.println("  [-] " + name + " не найден");
+                        }
+                    }
+                } finally {
+                    Arrays.fill(pwd, '\0');
+                }
+            } else {
+                // через KeePassHttp
+                KeePassHttpClient kp = new KeePassHttpClient();
+                for (String name : needed) {
+                    String v = kp.getSecretWithContext(service, context, name, !strict);
+                    if (v != null) secrets.put(name, v);
+                    else if (strict) { System.err.println("  [-] " + name + " не найден"); System.exit(1); }
                 }
             }
-            if (secrets.isEmpty()) {
-                System.err.println("Не удалось получить ни одного секрета.");
-                System.exit(1);
+
+            // 3. Подставляем плейсхолдеры в команду
+            List<String> finalCommand = new ArrayList<>(rawCommand.size());
+            for (String arg : rawCommand) {
+                Matcher m = PLACEHOLDER.matcher(arg);
+                StringBuilder sb = new StringBuilder();
+                int last = 0;
+                while (m.find()) {
+                    sb.append(arg, last, m.start());
+                    String name = m.group(1);
+                    String value = secrets.get(name);
+                    if (value == null) {
+                        System.err.println("Нет значения для {" + name + "} — оставляю как есть");
+                        sb.append(m.group(0));
+                    } else {
+                        sb.append(value);
+                    }
+                    last = m.end();
+                }
+                sb.append(arg.substring(last));
+                finalCommand.add(sb.toString());
             }
 
-            // 4. Собираем команду
-            List<String> command = new ArrayList<>();
-            command.add("docker");
-            command.add("compose");
-            if (composeFile != null) {
-                command.add("-f");
-                command.add(composeFile);
-                System.out.println("Используется compose-файл: " + composeFile);
+            // 4. Запускаем
+            if (showCmd) {
+                System.out.println("Команда: " + String.join(" ", finalCommand));
+            } else {
+                System.out.println("Запуск команды (аргументы не показываются во избежание утечки)…");
             }
-            command.add("up");
-            command.add("-d");
 
-            runCommand(command, secrets);
+            ProcessBuilder pb = new ProcessBuilder(finalCommand);
+            pb.inheritIO();
+            // Дополнительно прокидываем секреты в env — на случай, если приложение умеет читать из env
+            pb.environment().putAll(secrets);
+
+            int code = pb.start().waitFor();
+            System.out.println("Код завершения: " + code);
+            System.exit(code);
 
         } catch (Exception e) {
-            System.err.println("Критическая ошибка: " + e.getMessage());
+            System.err.println("Ошибка: " + e.getMessage());
             e.printStackTrace();
             System.exit(1);
         }
     }
 
-    private static void runCommand(List<String> command, Map<String, String> secrets) throws Exception {
-        ProcessBuilder pb = new ProcessBuilder(command);
-        pb.inheritIO();
+    private static char[] readPasswordSilently() throws Exception {
+        Console console = System.console();
+        if (console != null) return console.readPassword("Master password: ");
+        System.err.println("Нет TTY, читаю пароль из stdin");
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(System.in))) {
+            String line = r.readLine();
+            if (line == null) throw new Exception("Пароль не получен");
+            return line.toCharArray();
+        }
+    }
 
-        Map<String, String> environment = pb.environment();
-        environment.putAll(secrets);
-
-        System.out.println("Запуск: " + String.join(" ", command));
-        Process process = pb.start();
-        int exitCode = process.waitFor();
-        System.out.println("Команда завершена с кодом: " + exitCode);
+    private static void printUsage() {
+        System.err.println("""
+            Режим запуска команды:
+              java -jar launcher.jar --kdbx <path> [-s service] [-c context] [--strict] \\
+                  -- <команда> [аргументы]
+            
+              В аргументах можно использовать {VAR} — будут подставлены значения из KeePass.
+              Также все секреты автоматически прокидываются в переменные окружения команды.
+            
+            Режим .env (обратная совместимость):
+              java -jar launcher.jar --kdbx <path> [-s service] [-c context] [--strict]
+              (без "--" — берётся .env, плейсхолдеры не используются)
+            
+            Режим просмотра:
+              java -jar launcher.jar --kdbx <path> --get NAME  [-s service] [-c context] [-q]
+              java -jar launcher.jar --kdbx <path> --list       [-s service] [-c context]
+            
+            Опции:
+              -s, --service <name>   имя сервиса (по умолчанию — имя текущей папки)
+              -c, --context <name>   контекст: dev, prod, qa, ...
+                  --strict           запретить fallback, ошибка при отсутствии секрета
+                  --kdbx <path>      путь к файлу .kdbx
+                  --get <NAME>       вывести значение одного секрета
+                  --list             вывести имена секретов в группе
+              -q, --quiet            для --get: только значение
+                  --show-cmd         показать команду с подставленными секретами (ОПАСНО!)
+            
+            ⚠️  ВНИМАНИЕ: секреты, переданные аргументами, видны в /proc/<pid>/cmdline
+                и в ps aux. Если приложение умеет читать секреты из env — используйте
+                переменные окружения через ${VAR}, а не {VAR}.
+            """);
     }
 }

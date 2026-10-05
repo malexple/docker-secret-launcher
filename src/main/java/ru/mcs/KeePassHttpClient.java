@@ -21,8 +21,18 @@ import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.Properties;
 
+/**
+ * Клиент KeePassHttp — работает с запущенным KeePass 2 Classic
+ * и активным плагином KeePassHttp (обычно http://localhost:19455).
+ *
+ * Ассоциация выполняется один раз, ключ и Id сохраняются
+ * в %USERPROFILE%\.docker-launcher\keepasshttp.properties.
+ */
 public class KeePassHttpClient {
-    private static final String BASE_URL = "http://localhost:" + LauncherConfig.KEEPASSHTTP_PORT;
+
+    private static final String BASE_URL =
+            "http://localhost:" + LauncherConfig.KEEPASSHTTP_PORT;
+
     private final ObjectMapper mapper = new ObjectMapper();
     private String clientId;
     private byte[] aesKey;
@@ -31,10 +41,8 @@ public class KeePassHttpClient {
         loadAssociation();
     }
 
-    /**
-     * Загружает сохранённый ключ ассоциации и Id из локального файла.
-     * Если файла нет — выполняет ассоциацию.
-     */
+    // ==================== Ассоциация ====================
+
     private void loadAssociation() throws Exception {
         Path keyPath = Paths.get(LauncherConfig.KEY_STORE_FILE);
         if (Files.exists(keyPath)) {
@@ -46,7 +54,8 @@ public class KeePassHttpClient {
             this.aesKey = Base64.getDecoder().decode(props.getProperty("aesKey"));
 
             if (!testAssociate()) {
-                System.out.println("Сохранённая ассоциация недействительна. Требуется повторная ассоциация.");
+                System.out.println("Сохранённая ассоциация недействительна. "
+                        + "Требуется повторная ассоциация.");
                 associate();
             }
         } else {
@@ -54,11 +63,9 @@ public class KeePassHttpClient {
         }
     }
 
-    /**
-     * Первоначальная ассоциация с KeePassHttp.
-     */
     private void associate() throws Exception {
-        System.out.println("Выполняется ассоциация с KeePassHttp. Подтвердите запрос в KeePass.");
+        System.out.println("Выполняется ассоциация с KeePassHttp. "
+                + "Подтвердите запрос в KeePass.");
 
         byte[] keyBytes = new byte[32];
         new SecureRandom().nextBytes(keyBytes);
@@ -73,17 +80,15 @@ public class KeePassHttpClient {
 
         JsonNode response = sendRequest(request);
         if (!response.get("Success").asBoolean()) {
-            throw new IOException("Ассоциация не удалась: " + response.path("Error").asText());
+            throw new IOException("Ассоциация не удалась: "
+                    + response.path("Error").asText());
         }
         this.clientId = response.get("Id").asText();
         this.aesKey = keyBytes;
         saveAssociation();
-        System.out.println("Ассоциация успешно завершена. Id: " + clientId);
+        System.out.println("Ассоциация завершена. Id: " + clientId);
     }
 
-    /**
-     * Проверяет, что сохранённая ассоциация всё ещё действительна.
-     */
     private boolean testAssociate() throws Exception {
         ObjectNode request = mapper.createObjectNode();
         request.put("RequestType", "test-associate");
@@ -96,8 +101,11 @@ public class KeePassHttpClient {
         return response.get("Success").asBoolean();
     }
 
+    // ==================== Получение секретов ====================
+
     /**
-     * Получает пароль для указанного имени переменной (поле Url в KeePass).
+     * Низкоуровневый метод: ищет секрет по полю URL в KeePass.
+     * Используется из getSecretWithContext и может вызываться напрямую.
      */
     public String getSecret(String variableName) throws Exception {
         ObjectNode request = mapper.createObjectNode();
@@ -115,7 +123,6 @@ public class KeePassHttpClient {
             return null;
         }
 
-        // 🔑 Ключевое исправление: берём Nonce из ОТВЕТА
         String responseNonce = response.get("Nonce").asText();
         if (responseNonce == null || responseNonce.isEmpty()) {
             System.err.println("Ответ не содержит Nonce — не могу расшифровать поля.");
@@ -125,14 +132,51 @@ public class KeePassHttpClient {
         JsonNode entries = response.get("Entries");
         if (entries != null && entries.isArray() && !entries.isEmpty()) {
             String encryptedPassword = entries.get(0).get("Password").asText();
-            // Используем responseNonce как IV
             return decryptWithAes(encryptedPassword, aesKey, responseNonce);
         }
-        System.err.println("Секрет для переменной '" + variableName + "' не найден в KeePass.");
         return null;
     }
 
-    // --- Вспомогательные методы ---
+    /**
+     * Ищет секрет по пути:
+     *   context == null  →  <service>/<varName>
+     *   context != null  →  <service>/<context>/<varName>
+     *
+     * Если allowFallback = true и по контексту не нашли — пробуем
+     * путь без контекста (<service>/<varName>).
+     *
+     * @param service       имя сервиса (группа верхнего уровня в .env)
+     * @param context       dev, prod, qa, ... или null
+     * @param varName       имя переменной (совпадает с URL/Title записи)
+     * @param allowFallback разрешить fallback на корень сервиса
+     */
+    public String getSecretWithContext(String service,
+                                       String context,
+                                       String varName,
+                                       boolean allowFallback) throws Exception {
+        if (service == null || service.isEmpty()) {
+            // без сервиса — пробуем просто по имени переменной
+            return getSecret(varName);
+        }
+
+        String path = (context != null && !context.isEmpty())
+                ? service + "/" + context + "/" + varName
+                : service + "/" + varName;
+
+        String result = getSecret(path);
+        if (result != null) {
+            return result;
+        }
+
+        if (context != null && !context.isEmpty() && allowFallback) {
+            String rootPath = service + "/" + varName;
+            System.out.println("    fallback → " + rootPath);
+            result = getSecret(rootPath);
+        }
+        return result;
+    }
+
+    // ==================== Вспомогательные методы ====================
 
     private String generateNonce() {
         byte[] nonce = new byte[16];
@@ -140,7 +184,8 @@ public class KeePassHttpClient {
         return Base64.getEncoder().encodeToString(nonce);
     }
 
-    private String encryptWithAes(String plainText, byte[] key, String base64Iv) throws Exception {
+    private String encryptWithAes(String plainText, byte[] key, String base64Iv)
+            throws Exception {
         byte[] iv = Base64.getDecoder().decode(base64Iv);
         Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
         SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
@@ -150,7 +195,8 @@ public class KeePassHttpClient {
         return Base64.getEncoder().encodeToString(encrypted);
     }
 
-    private String decryptWithAes(String base64CipherText, byte[] key, String base64Iv) throws Exception {
+    private String decryptWithAes(String base64CipherText, byte[] key, String base64Iv)
+            throws Exception {
         byte[] iv = Base64.getDecoder().decode(base64Iv);
         byte[] cipherText = Base64.getDecoder().decode(base64CipherText);
         Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
